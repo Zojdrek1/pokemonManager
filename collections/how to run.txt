@@ -1,0 +1,6 @@
+py -u pricecharting_scraper_hires_v4.py --config config.csv --cache cache --out . --only-id 2 --debug-images --hires-tweak
+
+py -u pricecharting_scraper_hires_v4.py --config config.csv --cache cache --out . --only-id 2 --debug-images
+
+
+py -u pricecharting_scraper_hires_v5.py --config config.csv --cache cache --out . --only-id 3 --target-count 175 --max-rounds 900 --stagnant-limit 20 --max-pages 120 --debug-images --hires-tweak --strict-set-number
