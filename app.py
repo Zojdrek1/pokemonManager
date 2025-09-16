@@ -1,4 +1,31 @@
 import re
+
+
+
+# --- Variant ranking for collections gallery ---
+def _variant_rank(lookupid: str, name: str) -> int:
+    """
+    0 = Normal
+    1 = Reverse-Holo / Poké Ball
+    2 = Master Ball / Holo
+    """
+    s = f"{lookupid} {name}".lower()
+    # normalize punctuation for consistent matching
+    s = s.replace("–","-").replace("—","-")
+    # non-holo == base normal
+    if "non-holo" in s or "non holo" in s:
+        return 0
+    # strongest signals first
+    if "masterball" in s or "master-ball" in s or "master ball" in s:
+        return 2
+    # reverse & poké ball mid tier
+    if ("reverse" in s or "rev-holo" in s or "rev holo" in s 
+        or "pokeball" in s or "poké ball" in s or "poke-ball" in s or "poké ball" in s):
+        return 1
+    # plain holo last with masterball tier
+    if " holo" in s or s.endswith("holo") or "-holo" in s:
+        return 2
+    return 0
 # app.py
 import os
 import base64
@@ -439,6 +466,41 @@ def merge_by_lookupid(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="Pokémon Manager", layout="wide")
+
+
+# --- Global CSS: rounded grey background for radio groups (matches inputs) ---
+st.markdown(
+    """
+    
+    
+    <style>
+    /* Make radio container and group fill the entire column width */
+    div[data-testid="stRadio"] {
+        width: 100% !important;
+    }
+    /* Some Streamlit builds wrap the group in an extra div – cover both forms */
+    div[data-testid="stRadio"] > div[role="radiogroup"],
+    div[data-testid="stRadio"] > div:nth-child(2) {
+        width: 100% !important;
+        min-width: 100% !important;
+        box-sizing: border-box;
+        display: flex;
+        background: #f3f4f6;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 8px 12px;
+        gap: 10px;
+        justify-content: space-between; /* spread options nicely */
+    }
+    /* Keep label spacing neat */
+    div[data-testid="stRadio"] label { margin-bottom: 0.15rem; }
+    </style>
+
+    
+    """,
+    unsafe_allow_html=True
+)
+
 st.title("Pokémon Manager")
 
 # --- Simple navigation (modern, pill-style) ---
@@ -669,11 +731,43 @@ if _page_choice == "Collections":
     if missing:
         st.error("Config CSV missing required columns: " + ", ".join(sorted(missing)))
         st.stop()
+    # --- Language toggle for Collections ---
+    coll_lang_col, coll_sel_col = st.columns([1.6, 3.8])
+    with coll_lang_col:
+        coll_lang_choice = st.radio(
+        "Language (collections)",
+        ["Both", "English", "Japanese"],
+        index=0,
+        horizontal=True,
+        key="collections_lang"
+    )
 
-    names = coll_cfg["Name"].astype(str).tolist()
-    selected = st.selectbox("Choose a collection", names, index=0, key="collections_select")
+    def _infer_collection_lang(row):
+        try:
+            set_file_path = os.path.join(COLLECTIONS_DIR, str(row["fileName"]).strip())
+            sdf = pd.read_csv(set_file_path, nrows=50)
+            lk_col = next((c for c in ["lookupid","LookupID","lookupID","LookupId"] if c in sdf.columns), None)
+            if lk_col:
+                is_jp = sdf[lk_col].astype(str).str.startswith("pokemon-japanese-").any()
+                return "Japanese" if is_jp else "English"
+            # filename heuristic fallback
+            return "Japanese" if "japanese" in set_file_path.lower() else "English"
+        except Exception:
+            return "English"
 
-    row = coll_cfg[coll_cfg["Name"].astype(str) == selected].iloc[0]
+    _coll = coll_cfg.copy()
+    try:
+        _coll["_lang"] = _coll.apply(_infer_collection_lang, axis=1)
+    except Exception:
+        _coll["_lang"] = "English"
+
+    if coll_lang_choice != "Both":
+        _coll = _coll[_coll["_lang"] == coll_lang_choice]
+    with coll_sel_col:
+        names = _coll["Name"].astype(str).tolist()
+        selected = st.selectbox("Choose a collection", names, index=0, key="collections_select")
+
+    row = _coll[_coll["Name"].astype(str) == selected].iloc[0]
     set_file = os.path.join(COLLECTIONS_DIR, str(row["fileName"]).strip())
 
     # Load the chosen set CSV (comma-delimited)
@@ -758,6 +852,23 @@ if _page_choice == "Collections":
     except Exception:
         pass
 
+    
+    # Build quantity lookup (lookupid -> Quantity) from db.csv if possible
+    qty_by_lookup = {}
+    try:
+        if _db is not None:
+            cols_norm = {str(c).strip().lower(): c for c in _db.columns}
+            lk_col = cols_norm.get("lookupid") or cols_norm.get("lookup_id") or cols_norm.get("lookup id") or ("lookupID" if "lookupID" in _db.columns else None) or ("lookupid" if "lookupid" in _db.columns else None)
+            q_col = cols_norm.get("quantity") or ("Quantity" if "Quantity" in _db.columns else None)
+            if lk_col is not None and q_col is not None:
+                _tmp = _db[[lk_col, q_col]].copy()
+                _tmp[lk_col] = _tmp[lk_col].astype(str).str.strip().str.lower()
+                _tmp[q_col] = pd.to_numeric(_tmp[q_col], errors="coerce").fillna(0).astype(int)
+                # Sum duplicates by lookup id
+                _grp = _tmp.groupby(lk_col, as_index=True)[q_col].sum()
+                qty_by_lookup = _grp.to_dict()
+    except Exception:
+        qty_by_lookup = {}
     for lk in set_df["lookupid"].astype(str):
         if "/" in lk:
             set_lk, card_lk = lk.split("/", 1)
@@ -768,7 +879,16 @@ if _page_choice == "Collections":
         # Prefer friendly name if we know it, else derive from last segment
         nice_name = name_map.get(lk, card_lk.replace("-", " ").title())
         nice_name = urllib.parse.unquote(nice_name)
-        records.append({"lookupid": lk, "name": nice_name, "image": img_path, "exists": os.path.exists(img_path), "owned": (str(lk).strip().lower() in owned_lookup), "set_number": set_number_map.get(str(lk).strip().lower())})
+        records.append({
+    "lookupid": lk,
+    "name": nice_name,
+    "image": img_path,
+    "exists": os.path.exists(img_path),
+    "owned": (str(lk).strip().lower() in owned_lookup),
+    "quantity": int(qty_by_lookup.get(str(lk).strip().lower(), 0)),
+    "set_number": set_number_map.get(str(lk).strip().lower()),
+    "variant_rank": _variant_rank(lk, nice_name)
+})
 
     # Summary line
     total = len(records)
@@ -798,6 +918,18 @@ if _page_choice == "Collections":
     """, unsafe_allow_html=True)
 
 
+
+
+    # Ensure gallery ordering by set number then variant then name
+    def _num_or_inf(x):
+        try:
+            import math
+            if x is None: return float("inf")
+            xv = float(x)
+            return xv if not (isinstance(xv, float) and math.isnan(xv)) else float("inf")
+        except Exception:
+            return float("inf")
+    records.sort(key=lambda r: (_num_or_inf(r.get("set_number")), int(r.get("variant_rank", 0)), str(r.get("name","")).lower()))
     cards_html = ["<div style='display:flex;flex-wrap:wrap;gap:14px;justify-content:center;'>"]
     # Image sizing constants
     IMG_W = 180  # image width in pixels (crisper, larger)
@@ -826,8 +958,8 @@ if _page_choice == "Collections":
                 base_styles = f"width:{IMG_W}px;object-fit:contain;display:block;margin:0 auto;border-radius:8px;"
                 extra = "filter:grayscale(100%);opacity:0.75;border:2px solid #ef4444;" if not owned_flag else ""
                 img_tag = f"<img src='{data_uri}' style='{base_styles}{extra}'>"
-                overlay = ("<div style='position:absolute;top:4px;right:6px;font-size:22px;opacity:0.55;"
-                           "user-select:none;pointer-events:none;'>❌</div>") if not owned_flag else ""
+                qty = int(rec.get("quantity", 0))
+                overlay = (f"<div style='position:absolute;top:6px;right:6px;background:rgba(0,0,0,.75);color:#fff;border-radius:10px;padding:2px 6px;font-size:13px;font-weight:700;line-height:1;user-select:none;pointer-events:none;'>{qty}</div>" if (owned_flag and qty>0) else "<div style='position:absolute;top:6px;right:6px;background:rgba(0,0,0,.65);color:#fff;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:800;user-select:none;pointer-events:none;'>❌</div>")
                 pc_url = f"https://www.pricecharting.com/game/{urllib.parse.quote(rec['lookupid'], safe='/')}"
                 img_html = ("<div style='position:relative;display:inline-block;'>"
                             f"<a href=\"{pc_url}\" target=\"_blank\" rel=\"noopener\" title=\"{tooltip}\">"
@@ -1142,19 +1274,64 @@ if "run_bulk" in locals() and run_bulk:
 
 
 st.markdown("### 📋 Card List")
-all_sets = sorted(df["Set"].dropna().astype(str).unique().tolist())
-fc1, fc2 = st.columns(2)
-selected_set = fc1.selectbox("Filter by Set (table only)", ["All sets"] + all_sets, index=0)
-search_query  = fc2.text_input("Search Pokémon (table only)", placeholder="Type a name…").strip()
 
+# --- Language-aware filters (English / Japanese / Both) ---
+search_col, set_col, lang_col = st.columns([1, 1, 1])
+
+lang_choice = lang_col.radio(
+    "Language (table only)",
+    ["Both", "English", "Japanese"],
+    index=0,
+    horizontal=True,
+    key="cardlist_lang"
+)
+
+# Base DF for the Set dropdown depends on language
+_base_for_sets = df.copy()
+if lang_choice != "Both":
+    _base_for_sets = _base_for_sets[_base_for_sets["Set"].astype(str).str.startswith(f"[{lang_choice}]")]
+
+all_sets = sorted(_base_for_sets["Set"].dropna().astype(str).unique().tolist())
+
+selected_set = set_col.selectbox(
+    "Set (table only)",
+    ["All sets"] + all_sets,
+    index=0
+)
+
+search_query = search_col.text_input(
+    "Search (table only)",
+    placeholder="Type a name…"
+).strip()
+
+# Apply filters to the table copy
 table_df = df.copy()
+
+# 1) Language filter
+if lang_choice != "Both":
+    # Primary: look for the [English]/[Japanese] prefix in Set
+    lang_mask = table_df["Set"].astype(str).str.startswith(f"[{lang_choice}]")
+
+    # Optional fallback: infer from lookupID (treat non-japanese as English)
+    no_prefix = ~table_df["Set"].astype(str).str.match(r"^\[(English|Japanese)\]")
+    if lang_choice == "Japanese":
+        lang_mask = lang_mask | (no_prefix & table_df["lookupID"].astype(str).str.startswith("pokemon-japanese-"))
+    else:  # English
+        lang_mask = lang_mask | (no_prefix & ~table_df["lookupID"].astype(str).str.startswith("pokemon-japanese-"))
+
+    table_df = table_df[lang_mask]
+
+# 2) Set filter
 if selected_set != "All sets":
     table_df = table_df[table_df["Set"].astype(str) == selected_set]
+
+# 3) Name search
 if search_query:
     pat = re.escape(search_query)
     table_df = table_df[table_df["Name"].astype(str).str.contains(pat, case=False, na=False)]
 
 # ---- Build grid ----
+
 grid_df = table_df.copy().reset_index(drop=True)
 grid_df["Raw Price"]    = pd.to_numeric(grid_df["Raw Price"], errors="coerce").round(2)
 grid_df["PSA 10 Price"] = pd.to_numeric(grid_df["PSA 10 Price"], errors="coerce").round(2)
